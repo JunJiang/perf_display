@@ -1,0 +1,378 @@
+<html>
+
+<!--
+  Copyright (c) 2012 The Chromium Authors. All rights reserved.
+  Use of this source code is governed by a BSD-style license that can be
+  found in the LICENSE file.
+-->
+
+<head>
+
+<script src="js/common.js"></script>
+<script src="js/plotter.js"></script>
+<script src="js/coordinates.js"></script>
+<script src="js/config.js"></script>
+<script>
+document.title = Config.title + ' _ ' + Config.buildslave;
+
+var did_position_details = false;
+var units = 'thing-a-ma-bobs';
+var graph_list = [];
+var first_trace = '';
+
+var refresh_params = false;
+var params = ParseParams();
+if (!('history' in params)) {
+  params.history = 150;
+  refresh_params = true;
+}
+if (!('id' in params)) {
+  params.id= "perf_beta_wrt_win";
+}
+
+if (!('rev' in params)) {
+  params.rev = -1;  // -1 specifies the latest revision.
+  refresh_params = true;
+}
+if (refresh_params)
+  window.location.href = MakeURL(params);
+
+
+/**
+ * Encapsulates a *-summary.dat file.
+ * @constructor
+ */
+function Rows(data) {
+  this.rows = data.split('\n');
+  this.length = this.rows.length;
+}
+
+/**
+ * Returns the row at the given index.
+ */
+Rows.prototype.get = function(i) {
+  if (!this.rows[i].length) return null;
+  var row = JSON.parse(this.rows[i]);
+  row.revision = isNaN(row['rev']) ? row['rev'] : parseInt(row['rev']);
+  row.webkitRevision = isNaN(row['webkit_rev']) ?
+      row['webkit_rev'] : parseInt(row['webkit_rev']);
+  return row;
+};
+
+function report_error(error) {
+  document.getElementById("output").innerHTML = "<p>" + error + "</p>";
+}
+
+function received_graph_list(data, error, baseUrl) {
+  if (error) {
+    report_error(error);
+    return;
+  }
+  graph_list = JSON.parse(data);
+  
+  // Fetch the data for the selected graph.
+  if(baseUrl ==("../" + params.id + "/memory/")){
+     var graph_summary = [baseUrl + "ws_peak_b",baseUrl + "ws_peak_r"];
+     for(var i=0; i<graph_summary.length; i++)
+        {
+          fetch_summary(graph_summary[i]);
+        }
+  }
+  else if(baseUrl == ("../" + params.id + "/startup/")){
+     var graph_summary = [baseUrl + "cold",baseUrl + "warm"];
+     for(var i=0; i<graph_summary.length; i++)
+        {
+          fetch_summary(graph_summary[i]);
+        }
+  }
+}
+
+function go_to(graph) {
+  params.graph = graph;
+  if (params.graph == '')
+    delete params.graph;
+  window.location.href = MakeURL(params);
+}
+
+function get_url() {
+  var new_url = encodeURI(window.location.href);
+  new_url = new_url.replace(/'/g, '%27');
+  new_url = new_url.replace(/\&lookout=1/, '');
+  if (new_url.indexOf('http://') == 0 || new_url.indexOf('https://') == 0)
+    return new_url;
+  return '';
+}
+
+function received_summary(data, error,graph) {
+  if (error) {
+    report_error(error);
+    return;
+  }
+  // Parse the summary data file.
+  var rows = new Rows(data);
+  var max_rows = rows.length;
+  if (max_rows > params.history)
+    max_rows = params.history;
+
+  var allTraces = {};
+
+  // Find the start and end of the data slice we will focus on.
+  var start_row = 0;
+  if (params.rev > 0) {
+    var i = 0;
+    while (i < (rows.length -1)) {
+      var row = rows.get(i);
+
+      if (row.revision != params.rev) {
+        i++;
+        continue;
+      }
+  
+      start_row = i;
+      break;
+    }
+  }
+
+  // Some summary files contain data not listed in rev-descending order.  For
+  // those cases, it is possible we will find a start row in the middle of the
+  // data whose neighboring data is not nearby.  See xp-release-dual-core
+  // moz rev 265 => no graph.
+  var end_row = start_row + max_rows;
+
+  // Build and order a list of revision numbers.
+  var revisionNumbers = [];
+  var hasNumericRevisions = false;
+  // graphData[rev] = {trace1:[value, stddev], trace2:[value, stddev], ...}
+  var graphData = {};
+  for (var i = start_row; (i < end_row) && (i<rows.length); ++i) {
+    var row = rows.get(i);
+    if (!row)
+      continue;
+    var traces = row['traces'];
+    for (var j = 0; j < traces.length; ++j)
+      traces[j] = parseFloat(traces[j]);
+
+    graphData[row.revision] = traces;
+    if (isNaN(row.revision)) {
+      hasNumericRevisions = false;
+    }
+    revisionNumbers.push(
+        { chromium: row.revision, webkit: row.webkitRevision });
+
+    // Collect unique trace names.  If traces are explicitly specified in
+    // params, delete unspecified trace data.
+    for (var traceName in traces) {
+      if (typeof(params['trace']) != 'undefined' &&
+          params['trace'][traceName] != 1) {
+        delete(traces[traceName]);
+      }
+      allTraces[traceName] = 1;
+    }
+  }
+
+  // Build a list of all the trace names we've seen, in the order in which
+  // they appear in the data file. Although JS objects are not required by
+  // the spec to iterate their properties in order, in practice they do,
+  // because it causes compatibility problems otherwise.
+  var traceNames = [];
+  for (var traceName in allTraces)
+    traceNames.push(traceName);
+
+  first_trace = traceNames[0];
+
+  // If the revisions are numeric (svn), sort them numerically to ensure they
+  // are in ascending order. Otherwise, if the revisions aren't numeric (git),
+  // reverse them under the assumption the rows were prepended to the file.
+  if (hasNumericRevisions) {
+    revisionNumbers.sort(function(a, b) {
+        return parseInt(a.chromium, 10) - parseInt(b.chromium, 10);
+      });
+  } else {
+    revisionNumbers.reverse();
+  }
+
+  //KPI
+  var current_revision = -1;
+  var previous_revision = -1;
+
+  if(revisionNumbers.length >= 1)
+    current_revision = revisionNumbers[revisionNumbers.length -1].chromium;
+  if(revisionNumbers.length >= 2)
+    previous_revision = revisionNumbers[revisionNumbers.length -2].chromium;
+  var max_revision = -1;
+  var min_revision = -1;
+  var current_value = -1;
+  var previous_value = -1;
+  var max_value = -1;
+  var min_value = -1;
+
+  // Build separate ordered lists of trace data.
+  var traceData = {};
+  for (var revIndex = 0; revIndex < revisionNumbers.length; ++revIndex) {
+    var rev = revisionNumbers[revIndex].chromium;
+    var revisionData = graphData[rev];
+    for (var nameIndex = 0; nameIndex < traceNames.length; ++nameIndex) {
+      var traceName = traceNames[nameIndex];
+      if (!traceData[traceName])
+        traceData[traceName] = [];
+      if (!revisionData[traceName])
+        traceData[traceName].push([NaN, NaN]);
+      else{
+        if(traceName == 'ws_pk_b_1t' || traceName == 'ws_pk_r_1t' || traceName == 't'){
+             if((revisionData[traceName][0] > max_value) && (revIndex != revisionNumbers.length -1)){
+               max_value = revisionData[traceName][0];
+               max_revision = rev;
+             }
+
+             if((revisionData[traceName][0] < min_value || min_value == -1) && (revIndex != revisionNumbers.length -1)){   
+               min_value = revisionData[traceName][0];
+               min_revision = rev;              
+            }
+
+            if(revIndex == revisionNumbers.length -2){
+               previous_value = revisionData[traceName][0];
+            }
+            else if(revIndex == revisionNumbers.length -1){
+               current_value =  revisionData[traceName][0];
+            }
+
+        }
+             
+        traceData[traceName].push([parseFloat(revisionData[traceName][0]),
+                                   parseFloat(revisionData[traceName][1])]);
+      }
+    }
+  }
+ 
+  var current_gain_to_previous = 0;
+  if(previous_value > 0){
+     current_gain_to_previous = (current_value - previous_value)/previous_value;
+  } 
+
+  var x;
+  switch(graph)
+  {
+     case ("../" + params.id + "/startup/cold"):
+           x=document.getElementById('myTable').rows[1].cells         
+           break;
+     case ("../" + params.id + "/startup/warm"):
+           x=document.getElementById('myTable').rows[2].cells          
+           break;
+     case ("../" + params.id + "/memory/ws_peak_b"):
+           x=document.getElementById('myTable').rows[3].cells          
+           break;
+     case ("../" + params.id + "/memory/ws_peak_r"):
+           x=document.getElementById('myTable').rows[4].cells          
+           break;
+     default:
+         ;
+  }
+  
+  switch(graph)
+  {
+     case ("../" + params.id + "/startup/cold"):         
+     case ("../" + params.id + "/startup/warm"):           
+     case ("../" + params.id + "/memory/ws_peak_b"):         
+     case ("../" + params.id + "/memory/ws_peak_r"):
+           x[1].innerHTML= current_revision;
+           x[2].innerHTML= current_value;
+           if(previous_revision > 0){
+             x[3].innerHTML= previous_revision;
+             x[4].innerHTML= previous_value;
+             x[5].innerHTML= -current_gain_to_previous;
+           }
+           if(min_revision >0){
+              x[6].innerHTML= min_revision;
+              x[7].innerHTML= min_value;
+              if(min_value >0)
+                x[8].innerHTML= -(current_value - min_value)/min_value;
+           }
+           break;
+     default:
+         ;
+  }
+}
+
+function fetch_summary(graph) {
+
+  file = graph + "-summary.dat"
+  var baseUrl = params.baseUrl || '';
+  Fetch(baseUrl + file, received_summary,graph);
+}
+
+function fetch_graph_list(baseUrl) {
+  Fetch(baseUrl + "graphs.dat", received_graph_list, baseUrl);
+}
+
+function goToClosure(graph) {
+  return function(){go_to(graph)};
+}
+
+
+function init() {
+  var dataDir = "../" + params.id;
+  var baseUrl = [dataDir + "/memory/", dataDir + "/startup/"]
+  for(var i =0; i< baseUrl.length; i++)
+   fetch_graph_list(baseUrl[i]);
+}
+
+function changeRevision(){
+   var i = document.getElementById('revision').value
+   params.rev = i;
+   window.location.href = MakeURL(params);
+   window.load(get_url());
+   document.getElementById('revision').value = params.rev;
+}
+
+function create_tr(vect) {
+        document.write('<tr>');
+        var n = vect.length;
+        for(var i =0; i<n; i++){
+          document.write('<td>');
+          document.write(vect[i])
+          document.write('</td>')
+        }
+                
+        document.write('</tr>');
+}
+
+window.addEventListener("load", init, false);
+
+</script>
+</head>
+
+
+<body>
+<div id="description">
+<h1>Following is a table listing memory/startup status:</h1>
+</div>
+
+<div id="table_memory">
+<table id="myTable" border="2">
+<script> create_tr(["Startup/memory test","current revision","value","previous revision","value", "performance gain", "best revision before", "value", "performance gain"]) </script>
+<script> create_tr(["Cold Startup time: ms","NA","NA","NA","NA", "NA", "NA", "NA", "NA"]) </script>
+<script> create_tr(["Warm Startup time: ms","NA","NA","NA","NA", "NA", "NA", "NA", "NA"]) </script>
+<script> create_tr(["Peak Working Set(b): bytes","NA","NA","NA","NA", "NA", "NA", "NA", "NA"]) </script>
+<script> create_tr(["Peak Working Set(r): bytes","NA","NA","NA","NA", "NA", "NA", "NA", "NA"]) </script>
+</table>
+</div>
+
+<form>
+revision: <input typr="text" id="revision" size="30">
+<input type="button" onclick="changeRevision()" value="update">
+</form>
+
+
+   <script>
+    document.write('<p><h1>For startup details: please refer to: <a href="memory/report.html?baseUrl=' + '../../' + params.id + '/memory/' + '">Memory</a></h1></p>'); 
+    document.write('<p><h1>For startup details: please refer to: <a href="startup/report.html?baseUrl=' + '../../' + params.id + '/startup/' + '">Startup</a></h1></p>'); 
+   </script>
+
+
+<div>
+<p> 
+  <h1>For PnP test details: please refer to: <a href="http://pnp.sh.intel.com/intel-web-runtime">PnP Test</a> </h1>
+</p>
+</div>
+</body>
+</html>

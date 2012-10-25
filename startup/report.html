@@ -1,0 +1,524 @@
+<html>
+
+<!--
+  Copyright (c) 2012 The Chromium Authors. All rights reserved.
+  Use of this source code is governed by a BSD-style license that can be
+  found in the LICENSE file.
+-->
+
+<!--
+  For testing this file locally, start a localhost server at the root of the
+  perf directory (e.g. with "python -m SimpleHTTPServer") and pass in a
+  baseUrl as a query parameter, e.g.
+  http://localhost:8000/dashboard/ui/generic_plotter.html?history=150&rev=-1&graph=dom&baseUrl=http://localhost:8000/data/linux-release-webkit-latest/dromaeo_domcore/.
+
+  You need a localhost server to get around Chromium's restrictions on loading
+  file urls in XMLHttpRequests.
+
+  A brief note on terminology as used here: a "graph" is a plotted screenful
+  of data, showing the results of one type of test: for example, the
+  page-load-time graph.  A "trace" is a single line on a graph, showing one
+  one for the test: for example, the reference build trace on the
+  page-load-time graph.
+
+  This page plots arbitrary numerical data loaded from files in a specific
+  format.  It uses two or more data files, all JSON-encoded:
+
+    graphs.dat: a list of objects, each with these properties: name (the name
+        of a graph) and units (the units for the data to be read by humans).
+        Schematically:
+          [{"name": <graph_name>, "units": <units>}, ...]
+
+    <graphname>-summary.dat: for each of the graphs listed in graphs.dat, the
+        corresponding summary file holds rows of data. Each row of data is an
+        object with several properties:
+          "rev": the revision number for this row of data
+          "traces": an object with several properties of its own. The name of
+              the property corresponds to a trace name, used only as an
+              internal identifier, and the property's value is an array of
+              its measurement and that measurement's standard deviation (or
+              other measurement error).
+        Schematically:
+          {"rev": <rev>,
+           "traces": {<trace_name1>: [<value1>, <stddev1>],
+                      <trace_name2>: [<value2>, <stddev2>], ...}
+          }
+-->
+<head>
+<style>
+body {
+  font-family: sans-serif;
+}
+div#output {
+  cursor: pointer;
+}
+div#switcher * {
+  border: 1px solid black;
+  border-radius: 4px 4px 0 0;
+  padding-left: 0.5em;
+  padding-right: 0.5em;
+}
+div#switcher a {
+  background: #ddd;
+  cursor: pointer;
+}
+canvas.plot {
+  border: 1px solid black;
+}
+div.plot-coordinates {
+  font-family: monospace;
+}
+iframe {
+  display: none;
+  width: 100%;
+  height: 100%;
+  border: none;
+}
+.selector {
+  border: solid 1px black;
+  cursor: pointer;
+  padding-left: 0.3em;
+  background-color: white;
+  width: 80px;
+  display: inline-block;
+}
+.selector:hover {
+  background-color: rgb(200,200,250);
+}
+div#selectors {
+  display: none;
+  right: 6px;
+  position: absolute;
+}
+#explain {
+  font-size: 0.75em;
+  font-style: italic;
+  color: rgb(100,100,100);
+}
+#views {
+  border: 1px solid black;
+  width: 100%;
+  display: none;
+}
+#webkit-tab {
+  border-left: none;
+  display: none;
+}
+</style>
+
+<script src="js/common.js"></script>
+<script src="js/plotter.js"></script>
+<script src="js/coordinates.js"></script>
+<script src="js/config.js"></script>
+<script>
+document.title = Config.title + ' - ' + Config.buildslave;
+
+var did_position_details = false;
+var units = 'thing-a-ma-bobs';
+var graph_list = [];
+var first_trace = '';
+
+var refresh_params = false;
+var params = ParseParams();
+if (!('history' in params)) {
+  params.history = 150;
+  refresh_params = true;
+}
+if (!('rev' in params)) {
+  params.rev = -1;  // -1 specifies the latest revision.
+  refresh_params = true;
+}
+if (refresh_params)
+  window.location.href = MakeURL(params);
+
+if (!Config.detailTabs)
+  Config.detailTabs = {'view-change': 'CL'};
+
+/**
+ * Encapsulates a *-summary.dat file.
+ * @constructor
+ */
+function Rows(data) {
+  this.rows = data.split('\n');
+  this.length = this.rows.length;
+}
+
+/**
+ * Returns the row at the given index.
+ */
+Rows.prototype.get = function(i) {
+  if (!this.rows[i].length) return null;
+  var row = JSON.parse(this.rows[i]);
+  row.revision = isNaN(row['rev']) ? row['rev'] : parseInt(row['rev']);
+  row.webkitRevision = isNaN(row['webkit_rev']) ?
+      row['webkit_rev'] : parseInt(row['webkit_rev']);
+  return row;
+};
+
+function report_error(error) {
+  document.getElementById("output").innerHTML = "<p>" + error + "</p>";
+}
+
+function received_graph_list(data, error) {
+  if (error) {
+    report_error(error);
+    return;
+  }
+  graph_list = JSON.parse(data);
+
+  if (!('graph' in params) || params.graph == '') {
+    if (graph_list.length > 0)
+      params.graph = graph_list[0].name
+  }
+
+  // Add a selection tab for each graph, and find the units for the selected
+  // one while we're at it.
+  tabs = [];
+  for (var index = 0; index < graph_list.length; ++index) {
+    var graph = graph_list[index];
+    tabs.push(graph.name);
+    if (graph.name == params.graph)
+      units = graph.units;
+  }
+  initPlotSwitcher(tabs);
+
+  // Fetch the data for the selected graph.
+  fetch_summary();
+
+}
+
+function go_to(graph) {
+  params.graph = graph;
+  if (params.graph == '')
+    delete params.graph;
+  window.location.href = MakeURL(params);
+}
+
+function get_url() {
+  var new_url = encodeURI(window.location.href);
+  new_url = new_url.replace(/'/g, '%27');
+  new_url = new_url.replace(/\&lookout=1/, '');
+  if (new_url.indexOf('http://') == 0 || new_url.indexOf('https://') == 0)
+    return new_url;
+  return '';
+}
+
+function on_clicked_plot(prev_entry, current_entry) {
+  if ('lookout' in params) {
+    window.open(get_url());
+    return;
+  }
+
+  // Define sources for detail tabs
+  if ('view-change' in Config.detailTabs) {
+    // If the changeLinkPrefix has {PREV_CL}/{CL} markers, replace them.
+    // Otherwise, append to the URL.
+    var url = Config.changeLinkPrefix;
+    if (url.indexOf('{PREV_CL}') >= 0 || url.indexOf('{CL}') >= 0) {
+      url = url.replace('{PREV_CL}', prev_entry.chromium);
+      url = url.replace('{CL}', current_entry.chromium);
+    } else {
+      url += prev_entry.chromium + ':' + current_entry.chromium;
+    }
+    document.getElementById('view-change').setAttribute('src', url);
+  }
+  if ('view-pages' in Config.detailTabs) {
+    document.getElementById('view-pages').src = 'details.html?cl=' +
+      current_entry.chromium + '&graph=' + params.graph + '&trace=' +
+      first_trace;
+  }
+  if ('view-coverage' in Config.detailTabs) {
+    document.getElementById('view-coverage').src =
+        Config.coverageLinkPrefix + current_entry.chromium;
+  }
+  if (!isNaN(prev_entry.webkit) && !isNaN(current_entry.webkit) &&
+      prev_entry.webkit <= current_entry.webkit) {
+    Config.detailTabs['view-webkit-change'] = 'Webkit';
+    document.getElementById('webkit-tab').style.display = 'inline-block';
+    var url = 'http://trac.webkit.org/log/?verbose=on&rev=' +
+        current_entry.webkit + '&stop_rev=' + prev_entry.webkit;
+    document.getElementById('view-webkit-change').src = url;
+  } else {
+    var webkitView = document.getElementById('view-webkit-change');
+    if (webkitView.style.display == 'block')
+      show_first_view();
+    delete Config.detailTabs['view-webkit-change'];
+    document.getElementById('webkit-tab').style.display = 'none';
+  }
+
+  if (!did_position_details) {
+    show_first_view();
+    position_details();
+    did_position_details = true;
+  }
+}
+
+function show_first_view() {
+    for (var tab in Config.detailTabs) {
+      change_view(tab);
+      break; 
+    }  
+}
+
+function received_summary(data, error) {
+  if (error) {
+    report_error(error);
+    return;
+  }
+  // Parse the summary data file.
+  var rows = new Rows(data);
+  var max_rows = rows.length;
+  if (max_rows > params.history)
+    max_rows = params.history;
+
+  var allTraces = {};
+
+  // Find the start and end of the data slice we will focus on.
+  var start_row = 0;
+  if (params.rev > 0) {
+    var i = 0;
+    while (i < rows.length) {
+      var row = rows.get(i);
+
+      // If the current row's revision is higher than the desired revision,
+      // continue searching.
+      if (row.revision > params.rev) {
+        i++;
+        continue;
+      }
+
+      // We're either just under or at the desired revision.
+      start_row = i;
+
+      // If the desired revision does not exist, use the row before it.
+      if (row.revision < params.rev && start_row > 0)
+        start_row -= 1;
+
+      break;
+    }
+  }
+
+  // Some summary files contain data not listed in rev-descending order.  For
+  // those cases, it is possible we will find a start row in the middle of the
+  // data whose neighboring data is not nearby.  See xp-release-dual-core
+  // moz rev 265 => no graph.
+  var end_row = start_row + max_rows;
+
+  // Build and order a list of revision numbers.
+  var revisionNumbers = [];
+  var hasNumericRevisions = true;
+  // graphData[rev] = {trace1:[value, stddev], trace2:[value, stddev], ...}
+  var graphData = {};
+  for (var i = start_row; i < end_row; ++i) {
+    var row = rows.get(i);
+    if (!row)
+      continue;
+    var traces = row['traces'];
+    for (var j = 0; j < traces.length; ++j)
+      traces[j] = parseFloat(traces[j]);
+
+    graphData[row.revision] = traces;
+    if (isNaN(row.revision)) {
+      hasNumericRevisions = false;
+    }
+    revisionNumbers.push(
+        { chromium: row.revision, webkit: row.webkitRevision });
+
+    // Collect unique trace names.  If traces are explicitly specified in
+    // params, delete unspecified trace data.
+    for (var traceName in traces) {
+      if (typeof(params['trace']) != 'undefined' &&
+          params['trace'][traceName] != 1) {
+        delete(traces[traceName]);
+      }
+      allTraces[traceName] = 1;
+    }
+  }
+
+  // Build a list of all the trace names we've seen, in the order in which
+  // they appear in the data file. Although JS objects are not required by
+  // the spec to iterate their properties in order, in practice they do,
+  // because it causes compatibility problems otherwise.
+  var traceNames = [];
+  for (var traceName in allTraces)
+    traceNames.push(traceName);
+
+  first_trace = traceNames[0];
+
+  // If the revisions are numeric (svn), sort them numerically to ensure they
+  // are in ascending order. Otherwise, if the revisions aren't numeric (git),
+  // reverse them under the assumption the rows were prepended to the file.
+  if (hasNumericRevisions) {
+    revisionNumbers.sort(function(a, b) {
+        return parseInt(a.chromium, 10) - parseInt(b.chromium, 10);
+      });
+  } else {
+    revisionNumbers.reverse();
+  }
+
+  // Build separate ordered lists of trace data.
+  var traceData = {};
+  for (var revIndex = 0; revIndex < revisionNumbers.length; ++revIndex) {
+    var rev = revisionNumbers[revIndex].chromium;
+    var revisionData = graphData[rev];
+    for (var nameIndex = 0; nameIndex < traceNames.length; ++nameIndex) {
+      var traceName = traceNames[nameIndex];
+      if (!traceData[traceName])
+        traceData[traceName] = [];
+      if (!revisionData[traceName])
+        traceData[traceName].push([NaN, NaN]);
+      else
+        traceData[traceName].push([parseFloat(revisionData[traceName][0]),
+                                   parseFloat(revisionData[traceName][1])]);
+    }
+  }
+  var plotData = [];
+  for (var traceName in traceData)
+    plotData.push(traceData[traceName]);
+  var plotter = new Plotter(revisionNumbers, plotData, traceNames, units,
+    document.getElementById("output"));
+  plotter.onclick = on_clicked_plot;
+  plotter.plot();
+}
+
+function fetch_summary() {
+  if ('graph' in params)
+    file = escape(params.graph) + "-summary.dat"
+  else
+    file = "summary.dat"
+  var baseUrl = params.baseUrl || '';
+  Fetch(baseUrl + file, received_summary);
+}
+
+function fetch_graph_list() {
+  var baseUrl = params.baseUrl || '';
+  Fetch(baseUrl + "graphs.dat", received_graph_list);
+}
+
+function initPlotSwitcher(tabs) {
+  var switcher = document.getElementById("switcher");
+  for (var i = 0; i < tabs.length; i++) {
+    var is_selected = tabs[i] == params.graph;
+    var tab = document.createElement(is_selected ? "span" : "a");
+    tab.appendChild(document.createTextNode(tabs[i] + " "));
+    if (!is_selected)
+      tab.addEventListener("click", goToClosure(tabs[i]), false);
+    switcher.appendChild(tab);
+  }
+}
+
+function goToClosure(graph) {
+  return function(){go_to(graph)};
+}
+
+function position_details() {
+  var views = document.getElementById("views");
+  views.style.display = "block";
+  var selectors = document.getElementById("selectors");
+  selectors.style.display = "block";
+
+  var output = document.getElementById("output");
+  var views_width = output.offsetWidth - selectors.offsetWidth;
+
+  views.style.height = (window.innerHeight - output.offsetHeight -
+      output.offsetTop - 16) + "px";
+  selectors.style.top = (views.offsetTop - selectors.offsetHeight + 1) + "px";
+}
+
+function change_view(target) {
+  for (var tab in Config.detailTabs) {
+    document.getElementById(tab).style.display = 
+        (tab == target ? "block" : "none");
+  }
+}
+
+function init() {
+  // We need to fill the graph list before parsing the params or fetching the
+  // data, so we have a default graph in case none was specified.
+  fetch_graph_list();
+}
+
+window.addEventListener("resize", position_details, false);
+window.addEventListener("load", init, false);
+</script>
+</head>
+
+
+<body>
+<div id="header_lookout" align="center">
+  <font style='color: #0066FF; font-family: Arial, serif;
+               font-size: 20pt; font-weight: bold;'>
+    <script>
+      document.write("<a target=\"_blank\" href=\"");
+      document.write(get_url());
+      document.write("\">");
+      if ('header' in params && params.header != '') {
+        document.write(escape(params.header));
+      } else {
+        document.write(Config.title);
+      }
+      document.write("</a>");
+    </script>
+  </font>
+</div>
+
+<div id="header_text">
+Builds generated by the <a href="http://wrt-buildbot.bj.intel.com/buildbot/builders/beta-wrt-win-builder">Chromium Buildbot</a>
+are run through <b>
+<script>
+document.write(Config.title);
+</script>
+</b>and the results of that test are charted here.
+</div>
+
+<div id="explain">
+The vertical axis is measured values, and the horizontal
+axis is the revision number for the build being tested.
+</div>
+<p></p>
+<div id="switcher">
+
+</div>
+<div id="output"></div>
+<div id="details">
+  <div id="views">
+    <script>
+      for (var tab in Config.detailTabs) {
+        document.write("<iframe id=\"" + tab + "\"></iframe>");
+      }
+    </script>
+    <iframe id='view-webkit-change'></iframe>
+  </div>
+  <div id="selectors">
+    <script>
+      var firstTab = true;
+      for (var tab in Config.detailTabs) {
+        document.write("<div ");
+	if (firstTab) {
+	  firstTab = false;
+	} else {
+    document.write("style=\"border-left: none\" ");
+	}
+	document.write("class=\"selector\" onclick=\"change_view('" 
+	    + tab + "')\">" + Config.detailTabs[tab] + "</div>");
+      }
+    </script><div id="webkit-tab" class="selector"
+      onclick="change_view('view-webkit-change')">Webkit</div>
+  </div>
+</div>
+<pre id="log"></pre>
+<script>
+if ('lookout' in params) {
+  document.getElementById("switcher").style.display = "none";
+  document.getElementById("details").style.display = "none";
+  document.getElementById("header_text").style.display = "none";
+  document.getElementById("explain").style.display = "none";
+  if ('thumbnail' in params) {
+    document.getElementById("header_lookout").style.display = "none";
+  }
+} else {
+  document.getElementById("header_lookout").style.display = "none";
+}
+</script>
+</body>
+</html>
