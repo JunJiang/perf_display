@@ -19,6 +19,7 @@ var did_position_details = false;
 var units = 'thing-a-ma-bobs';
 var graph_list = [];
 var first_trace = '';
+var abs_url = "http://wrt-buildbot.bj.intel.com/perf_data/";
 
 var refresh_params = false;
 var params = ParseParams();
@@ -71,14 +72,14 @@ function received_graph_list(data, error, baseUrl) {
   graph_list = JSON.parse(data);
   
   // Fetch the data for the selected graph.
-  if(baseUrl ==("../" + params.id + "/memory/")){
+  if(baseUrl ==(abs_url + params.id + "/memory/")){
      var graph_summary = [baseUrl + "ws_peak_b",baseUrl + "ws_peak_r"];
      for(var i=0; i<graph_summary.length; i++)
         {
           fetch_summary(graph_summary[i]);
         }
   }
-  else if(baseUrl == ("../" + params.id + "/startup/")){
+  else if(baseUrl == (abs_url + params.id + "/startup/")){
      var graph_summary = [baseUrl + "cold",baseUrl + "warm"];
      for(var i=0; i<graph_summary.length; i++)
         {
@@ -252,16 +253,16 @@ function received_summary(data, error,graph) {
   var x;
   switch(graph)
   {
-     case ("../" + params.id + "/startup/cold"):
+     case (abs_url + params.id + "/startup/cold"):
            x=document.getElementById('myTable').rows[1].cells         
            break;
-     case ("../" + params.id + "/startup/warm"):
+     case (abs_url + params.id + "/startup/warm"):
            x=document.getElementById('myTable').rows[2].cells          
            break;
-     case ("../" + params.id + "/memory/ws_peak_b"):
+     case (abs_url + params.id + "/memory/ws_peak_b"):
            x=document.getElementById('myTable').rows[3].cells          
            break;
-     case ("../" + params.id + "/memory/ws_peak_r"):
+     case (abs_url + params.id + "/memory/ws_peak_r"):
            x=document.getElementById('myTable').rows[4].cells          
            break;
      default:
@@ -270,10 +271,10 @@ function received_summary(data, error,graph) {
   
   switch(graph)
   {
-     case ("../" + params.id + "/startup/cold"):         
-     case ("../" + params.id + "/startup/warm"):           
-     case ("../" + params.id + "/memory/ws_peak_b"):         
-     case ("../" + params.id + "/memory/ws_peak_r"):
+     case (abs_url + params.id + "/startup/cold"):         
+     case (abs_url + params.id + "/startup/warm"):           
+     case (abs_url + params.id + "/memory/ws_peak_b"):         
+     case (abs_url + params.id + "/memory/ws_peak_r"):
            x[1].innerHTML= current_revision;
            x[2].innerHTML= current_value;
            if(previous_revision > 0){
@@ -310,7 +311,7 @@ function goToClosure(graph) {
 
 
 function init() {
-  var dataDir = "../" + params.id;
+  var dataDir = abs_url + params.id;
   var baseUrl = [dataDir + "/memory/", dataDir + "/startup/"]
   for(var i =0; i< baseUrl.length; i++)
    fetch_graph_list(baseUrl[i]);
@@ -364,8 +365,8 @@ revision: <input typr="text" id="revision" size="30">
 
 
    <script>
-    document.write('<p><h1>For startup details: please refer to: <a href="memory/report.html?baseUrl=' + '../../' + params.id + '/memory/' + '">Memory</a></h1></p>'); 
-    document.write('<p><h1>For startup details: please refer to: <a href="startup/report.html?baseUrl=' + '../../' + params.id + '/startup/' + '">Startup</a></h1></p>'); 
+    document.write('<p><h1>For startup details: please refer to: <a href="memory/report.html?baseUrl=' + abs_url + params.id + '/memory/' + '">Memory</a></h1></p>'); 
+    document.write('<p><h1>For startup details: please refer to: <a href="startup/report.html?baseUrl=' + abs_url + params.id + '/startup/' + '">Startup</a></h1></p>'); 
    </script>
 
 
